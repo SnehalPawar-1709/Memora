@@ -1,24 +1,14 @@
 // ============================================================
 // MEMORA - Email Service
 // Sends professional HTML email + PDF summary attachment
+// Uses Brevo (Sendinblue) HTTPS API — works on Render free tier,
+// and can send to ANY recipient without domain verification.
 // ============================================================
-const nodemailer = require('nodemailer');
+const axios = require('axios');
 
-const isConfigured = () => {
-  const u = (process.env.EMAIL_USER || '').trim();
-  const p = (process.env.EMAIL_PASS || '').replace(/\s/g, '');
-  return u.includes('@') && p.length >= 16;
-};
+const isConfigured = () => !!(process.env.BREVO_API_KEY || '').trim();
 
-const makeTransport = () => nodemailer.createTransport({
-  host: 'smtp.gmail.com', port: 587, secure: false,
-  auth: {
-    user: (process.env.EMAIL_USER || '').trim(),
-    pass: (process.env.EMAIL_PASS || '').replace(/\s/g, ''),
-  },
-  connectionTimeout: 15000,
-  socketTimeout:     30000,
-});
+const BREVO_SEND_URL = 'https://api.brevo.com/v3/smtp/email';
 
 // ── Generate PDF buffer using PDFKit ─────────────────────────
 const generatePDF = (data) => {
@@ -342,30 +332,21 @@ const sendSummaryEmails = async (data) => {
     // Continue without PDF if generation fails
   }
 
-  // Verify SMTP
-  let transport;
-  try {
-    transport = makeTransport();
-    await transport.verify();
-    console.log(`SMTP verified — sending to ${emails.length} recipients`);
-  } catch(e) {
-    console.error('SMTP verify failed:', e.message);
-    return { sent: 0, failed: emails.length, error: e.message, log: [] };
-  }
+  console.log(`Brevo configured — sending to ${emails.length} recipients`);
 
   const pdfName = `meeting-summary-${data.meetingId}.pdf`;
-  const from    = `"${(process.env.EMAIL_FROM_NAME || 'Memora').trim()}" <${(process.env.EMAIL_USER || '').trim()}>`;
+  const senderEmail = (process.env.EMAIL_USER || '').trim();
+  const senderName  = (process.env.EMAIL_FROM_NAME || 'Memora').trim();
   const subject = `Meeting Summary — ${data.topic}`;
   const html    = buildHTML(data);
   const text    = buildText(data);
 
-  // Build attachments array
-  const attachments = [];
+  // Build Brevo-style attachment (base64 content)
+  const attachment = [];
   if (pdfBuffer) {
-    attachments.push({
-      filename:    pdfName,
-      content:     pdfBuffer,
-      contentType: 'application/pdf',
+    attachment.push({
+      name:    pdfName,
+      content: pdfBuffer.toString('base64'),
     });
   }
 
@@ -374,13 +355,32 @@ const sendSummaryEmails = async (data) => {
 
   for (const email of emails) {
     try {
-      await transport.sendMail({ from, to: email, subject, html, text, attachments });
-      console.log(`✓ Email sent → ${email}`);
+      const response = await axios.post(
+        BREVO_SEND_URL,
+        {
+          sender:      { name: senderName, email: senderEmail },
+          to:          [{ email }],
+          subject,
+          htmlContent: html,
+          textContent: text,
+          attachment:  attachment.length ? attachment : undefined,
+        },
+        {
+          headers: {
+            'api-key':      process.env.BREVO_API_KEY,
+            'Content-Type': 'application/json',
+            'Accept':       'application/json',
+          },
+          timeout: 20000,
+        }
+      );
+      console.log(`✓ Email sent → ${email} (messageId: ${response.data?.messageId || 'n/a'})`);
       log.push({ email, status: 'sent', sentAt: new Date() });
       sent++;
     } catch(e) {
-      console.error(`✗ Email failed → ${email}: ${e.message}`);
-      log.push({ email, status: 'failed', error: e.message, sentAt: new Date() });
+      const errMsg = e.response?.data?.message || e.message;
+      console.error(`✗ Email failed → ${email}: ${errMsg}`);
+      log.push({ email, status: 'failed', error: errMsg, sentAt: new Date() });
       failed++;
     }
   }
@@ -388,14 +388,18 @@ const sendSummaryEmails = async (data) => {
   return { sent, failed, log };
 };
 
-// ── SMTP test ─────────────────────────────────────────────────
+// ── Brevo config test ────────────────────────────────────────
 const testEmail = async () => {
-  if (!isConfigured()) return { ok: false, message: 'EMAIL_USER or EMAIL_PASS not set in .env' };
+  if (!isConfigured()) return { ok: false, message: 'BREVO_API_KEY not set in env' };
   try {
-    await makeTransport().verify();
-    return { ok: true, message: `SMTP verified for ${process.env.EMAIL_USER}` };
+    // Lightweight check: fetch account info to confirm the key works
+    const response = await axios.get('https://api.brevo.com/v3/account', {
+      headers: { 'api-key': process.env.BREVO_API_KEY },
+      timeout: 10000,
+    });
+    return { ok: true, message: `Brevo API key is valid for account: ${response.data?.email || 'unknown'}` };
   } catch(e) {
-    return { ok: false, message: e.message };
+    return { ok: false, message: e.response?.data?.message || e.message };
   }
 };
 
